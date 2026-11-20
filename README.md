@@ -1,130 +1,102 @@
-# Verified Doc QA
+# Deep Research Agent
 
-**Question answering over your documents that knows when to say "I don't know". It checks whether
-the documents can answer at all, answers with citations, fact-checks its own answer against the
-sources, and tells you whether the answer was verified.**
-
-> "How many unused leave days can I carry over?" → *"Up to 5 unused days can be carried over;
-> they expire on 31 March [1]."* · **Verified** · [1] leave-policy.md › Annual leave
->
-> "Who is the CEO?" → *"I can't answer that from the indexed documents."* · **Not in documents**
+**Give it a topic. It plans sub-questions, researches them in parallel, writes a report that
+cites every claim, has a critic score the draft, researches the gaps and revises, then checks
+every citation deterministically. Every step is checkpointed, so a run can pause for your
+approval of the plan, survive a crash, and be resumed later.**
 
 <!-- demo GIF: docs/demo.gif (record with the Streamlit UI) -->
 
 ## Why this project
-Plain RAG fails quietly. It answers off-topic questions from the model's memory, cites sources
-that don't say what the answer says, and gives no signal when it is guessing. This project wraps
-retrieval in an agentic workflow with two gates, and it **measures** both retrieval quality and
-answer quality.
+One search and one LLM call (the "baseline") gives shallow, single-angle reports. Long agent
+loops can be slow, expensive and hard to trust. This project uses well-known agent patterns
+(orchestrator-workers, reflexion and human-in-the-loop) with hard limits, and evaluates the
+agent **against the baseline** to show whether the extra cost buys better reports.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    Q[Question] --> RET[Retrieve<br/>BM25 + dense, RRF<br/>→ cross-encoder rerank]
-    RET --> GR{Grade relevance<br/>CAN_ANSWER / PARTIAL / NO_MATCH}
-    GR -- NO_MATCH --> REF[Refuse]
-    GR -- CAN_ANSWER / PARTIAL --> GEN[Generate<br/>structured: answer + citations]
-    GEN -- not answerable --> REF
-    GEN --> VER{Verify<br/>supported? contradictions?}
-    VER -- passed --> OK[Answered ✓]
-    VER -- failed, attempts left --> GEN
-    VER -- failed, no attempts --> UNV[Unverified ⚠]
-    subgraph Index
-      ING[Ingest .md .txt .pdf<br/>heading-aware chunks<br/>optional contextual retrieval] --> QD[(Qdrant)]
-    end
-    QD -.-> RET
+    T[Topic] --> P[Plan<br/>structured sub-questions + queries]
+    P --> H{Review plan<br/>optional interrupt}
+    H -- approve / edit --> W1[Worker 1<br/>search → findings]
+    H --> W2[Worker 2]
+    H --> W3[Worker N]
+    W1 & W2 & W3 --> WR[Write<br/>cited Markdown report]
+    WR --> C{Critique<br/>score 1-10, gaps, follow-ups}
+    C -- score < bar and rounds left --> F[Follow-up workers] --> WR
+    C -- good enough / out of rounds --> FIN[Finalize<br/>citation check + References]
+    S[(SQLite checkpoints)] -.- P & WR & C
 ```
 
-- **LangGraph** `StateGraph` with conditional edges and a bounded retry loop. The verifier's list
-  of unsupported claims is sent back to the generator as feedback.
-- **Structured outputs** (Pydantic) at every LLM step. No parsing of free-text labels.
-- **Citations are checked**: `[n]` markers that point outside the retrieved set are dropped, and an
-  answer that cites nothing can never pass verification.
-- The response includes the status, citations with their text, everything retrieved, the
-  verification report, the attempts, and per-node timings.
+- **LangGraph** `StateGraph`. Workers fan out with `Send`, their sources and findings merge
+  through list reducers, and the critique loop is bounded by `MAX_ROUNDS` and `QUALITY_BAR`.
+- **Structured outputs** for the plan, findings, critique and judge, so a weak model fails in one
+  step, which falls back, instead of derailing the run.
+- **Citations are global and checked.** Sources are numbered once by URL across all workers, the
+  writer cites those numbers, and `finalize` removes references to sources that don't exist,
+  counts paragraphs without a citation, and rebuilds the References list from what was cited.
+- **Human in the loop:** with `APPROVE_PLAN=1` the run pauses at `interrupt()`. Resume with
+  approval, an edited list of sub-questions, or a rejection, even from another process.
+- **Search providers:** Tavily (API key), Wikipedia and arXiv (no keys), or an offline corpus for
+  tests. Results are interleaved and de-duplicated, and a failing provider is skipped.
 
 ## Evaluation
 
-`make eval` indexes the bundled corpus into a fresh in-memory collection and runs
-`evals/qa_cases.jsonl`: 35 hand-labelled questions. 27 are answerable, each with a gold document,
-an evidence sentence and key facts. 8 are unanswerable (they test refusal).
+`make eval` runs the agent and the baseline on 8 technical topics (`evals/topics.jsonl`), each
+with 5 hand-written key points:
 
-**1. Retrieval ablation** (answerable questions; a hit is the first chunk containing the evidence sentence)
+| Metric | How |
+|---|---|
+| Key-point coverage | an LLM judge marks which key points each report covers |
+| Valid citations · uncited paragraphs | deterministic, from the citation checker |
+| Pairwise preference | the judge compares both reports **twice with the order swapped**; a win needs both orders to agree, which controls for position bias |
+| Cost | seconds per report, critique rounds, sources cited |
 
-| Retrieval | hit@1 | recall@5 | MRR@10 |
-|---|---|---|---|
-| BM25 | _run `make eval`_ | | |
-| Dense (`nomic-embed-text`) | | | |
-| Hybrid (RRF 0.4 / 0.6) | | | |
-| Hybrid + cross-encoder rerank | | | |
+Results (run `make eval` with your model; `evals/results.md` is written for you):
 
-Offline sanity run (`make eval-fake`, CI): with a bag-of-words *hashing* embedding instead of a real
-model, BM25 89% / 100% / 0.935, "dense" 85% / 96% / 0.902, hybrid 89% / 100% / 0.935
-(hit@1 / recall@5 / MRR@10). The corpus is small and keyword-friendly. Real embeddings matter more
-on paraphrased questions, which is what the table above is for.
-
-**2. End to end**
-
-| Metric | `ollama:qwen3:8b` | `openai:gpt-4o-mini` |
+| Metric | Agent | Baseline |
 |---|---|---|
-| Unanswerable correctly refused | _run `make eval`_ | |
-| Answerable not refused | | |
-| Key-fact accuracy | | |
-| Citation precision (cited chunk from the gold doc) | | |
-| Verified rate | | |
-| Judge faithfulness / correctness (1-5) | | |
-| Mean attempts · median latency | | |
+| Key-point coverage | _run `make eval`_ | |
+| Valid citations | | |
+| Uncited paragraphs | | |
+| Sources cited | | |
+| Seconds per report | | |
+| Pairwise wins (agent / baseline / tie) | | |
 
-`evals/results.md` is written by each run, ready to paste here.
+Use a judge model that is stronger than, and different from, the model under test
+(`JUDGE_PROVIDER=openai JUDGE_MODEL=gpt-4o`).
 
 ## Quick start
 
 ```bash
-git clone <this repo> && cd verified-doc-qa
 python -m venv .venv && source .venv/bin/activate
-make install                              # pip install -e ".[dev,ui,rerank]"
-ollama pull qwen3:8b && ollama pull nomic-embed-text   # or LLM_PROVIDER=openai (see .env.example)
+make install                                  # pip install -e ".[dev,ui]"
+ollama pull qwen3:8b                          # or LLM_PROVIDER=openai / anthropic
 
-docqa ingest corpus                       # or your own folder of .md / .txt / .pdf
-docqa ask "Can I fly premium economy on a 7-hour flight?"
-make api                                  # http://localhost:8000/docs
-make ui                                   # http://localhost:8501 (needs the API running)
-make test                                 # offline: scripted model + hashing embeddings
+research run "How does speculative decoding speed up LLM inference?" --out report.md
+research run "Mixture-of-experts trade-offs" --approve-plan    # pauses after planning
+research resume <thread>                                        # approve and continue
+research resume <thread> --sub-question "..." --sub-question "..."   # or replace the plan
+research show <thread>
+make api            # POST /research, GET /research/{id}, POST /research/{id}/approve
+make ui             # Streamlit (needs the API running)
+make test           # offline: scripted model + offline search corpus
 ```
 
-Docker (API + UI + Ollama + Qdrant):
-
-```bash
-docker compose up --build
-docker compose exec ollama ollama pull qwen3:8b
-docker compose exec ollama ollama pull nomic-embed-text
-docker compose exec api docqa ingest corpus
-```
-
-### API
-
-| Method | Path                  |                                                                                             |
-| ------ | --------------------- | ------------------------------------------------------------------------------------------- |
-| POST   | `/ingest`             | multipart `files` (.md, .txt, .pdf). Re-uploading a file replaces its chunks                |
-| GET    | `/documents`          | indexed documents and their chunk counts                                                    |
-| DELETE | `/documents/{source}` | remove a document                                                                           |
-| POST   | `/ask`                | `{"question": "..."}` → status, answer, citations, retrieved, verification, attempts, steps |
-| GET    | `/health`             | provider, models, retrieval settings                                                        |
-
+Docker: `docker compose up --build`, then `docker compose exec ollama ollama pull qwen3:8b`.
 
 ## Project layout
 
 ```
-src/verified_doc_qa/
-  config.py    settings from env / .env
-  llm.py       chat + embedding factories (ollama | openai | anthropic | fake), scripted fake model
-  ingest.py    loaders, heading-aware chunking, contextual retrieval
-  store.py     Qdrant + BM25 over the same chunks
-  retrieve.py  dense | bm25 | hybrid (RRF) → rerank → top-n
-  graph.py     LangGraph workflow → AskResponse
+src/deep_research/
+  config.py     settings (provider, search, rounds, quality bar, plan approval, checkpoint db)
+  llm.py        chat-model factory (ollama | openai | anthropic | fake) + scripted fake model
+  search.py     tavily | wikipedia | arxiv | fake, multi-provider merge
+  graph.py      the LangGraph workflow + Researcher (start / resume / status)
+  citations.py  deterministic citation check and References
+  baseline.py   one search + one call, for comparison
   api.py ui.py cli.py
-corpus/        a fictional company handbook (written for this repo)
-evals/         qa_cases.jsonl + run_eval.py
-tests/         chunking, BM25/RRF, store, every graph path, API, eval metrics (all offline)
+evals/          topics.jsonl + run_eval.py (agent vs baseline, LLM judge)
+tests/          every graph path (loop, cap, approve/edit/reject, resume in a new process), citations, search, API, eval
 ```
