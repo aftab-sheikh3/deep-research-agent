@@ -86,18 +86,6 @@ make test           # offline: scripted model + offline search corpus
 
 Docker: `docker compose up --build`, then `docker compose exec ollama ollama pull qwen3:8b`.
 
-## Design decisions and trade-offs
-
-| Decision | Why | Trade-off |
-|---|---|---|
-| Planner + parallel workers (orchestrator-workers) | breadth: each sub-question gets its own searches, and the workers run concurrently | more LLM calls (one extraction per worker) |
-| Workers extract findings before writing | the writer sees compact, attributed facts instead of raw pages, which keeps the context small and citations precise | extraction can drop nuance |
-| Critic + bounded revision loop (reflexion) | targeted follow-up searches for what is missing | each round costs a write + a critique; the critic can be lenient, so the bar is configurable |
-| Deterministic citation check after the LLM | catches invented `[n]` numbers and uncited paragraphs without another model call | checks that a source *exists*, not that it *supports* the claim (the critic and the judge cover that) |
-| SQLite checkpointer | pause/resume, crash recovery and inspection of every step for free | one file; use Postgres for many concurrent users |
-| Strip `<think>` blocks | reasoning models (e.g. qwen3) otherwise leak their thoughts into the report | none |
-| Baseline in the eval | an agent is only worth its latency if it beats a cheap baseline | the judge is an LLM: use a different, stronger one, and read some reports yourself |
-
 ## Project layout
 
 ```
