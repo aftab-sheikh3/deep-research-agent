@@ -1,0 +1,32 @@
+# docker compose up --build   ->  API http://localhost:8000/docs · UI http://localhost:8501
+# First run: docker compose exec ollama ollama pull qwen3:8b
+services:
+  ollama:
+    image: ollama/ollama:latest
+    ports: ["11434:11434"]
+    volumes: [ollama:/root/.ollama]
+
+  api:
+    build: .
+    env_file: [{path: .env, required: false}]
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
+      OLLAMA_BASE_URL: http://ollama:11434
+    ports: ["8000:8000"]
+    volumes: [checkpoints:/app/data]     # research threads survive restarts
+    depends_on: [ollama]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+
+  ui:
+    build: .
+    command: ["streamlit", "run", "src/deep_research/ui.py", "--server.address=0.0.0.0", "--server.port=8501"]
+    environment:
+      API_URL: http://api:8000
+    ports: ["8501:8501"]
+    depends_on: [api]
+
+volumes:
+  ollama:
+  checkpoints:

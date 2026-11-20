@@ -1,0 +1,4 @@
+# Normalize line endings; keep LF in the repo so Makefile/Dockerfile/CI work everywhere.
+* text=auto eol=lf
+*.png binary
+*.gif binary
